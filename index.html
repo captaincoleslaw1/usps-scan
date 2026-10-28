@@ -57,11 +57,12 @@
     <input id="num" inputmode="numeric" placeholder="Or type a tracking number" autocomplete="off">
     <button type="submit">Track</button>
   </form>
-  <div class="ver">v5</div>
+  <div class="ver">v6</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/iife/reader/index.js"></script>
 <script>
   const statusEl = document.getElementById('status');
   const debugEl = document.getElementById('debug');
@@ -236,6 +237,84 @@
         }
       } catch (e) { /* native path failed - ZXing below gets its turn */ }
     }
+    // Pro engine: zxing-cpp compiled to WebAssembly - the same decoder
+    // family that reads these labels instantly from still photos - fed
+    // live camera frames on a timer. It localizes every code in the
+    // frame (the GS1-128 AND the hardier Data Matrix copy of the same
+    // payload these labels carry) and we keep the first one that parses
+    // as a tracking number.
+    if (!window.__noWasm && typeof ZXingWASM !== 'undefined') {
+      let wstream = null;
+      try {
+        debugEl.textContent = 'Loading pro scanner...';
+        await ZXingWASM.prepareZXingModule({
+            overrides: { locateFile: (path) => path.endsWith('.wasm')
+              ? 'https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/reader/zxing_reader.wasm'
+              : path },
+            fireImmediately: true
+          });
+        const ladder = [
+          { video: { facingMode: { ideal: 'environment' }, width: { min: 1920 }, height: { min: 1080 } }, audio: false },
+          { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false },
+          { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
+          { video: true, audio: false }
+        ];
+        let werr = null;
+        for (const c of ladder) {
+          try { wstream = await navigator.mediaDevices.getUserMedia(c); break; }
+          catch (e) { werr = e; if (e && e.name !== 'OverconstrainedError' && e.name !== 'NotFoundError') throw e; }
+        }
+        if (!wstream) throw werr || new Error('no camera');
+        const video = document.getElementById('video');
+        video.srcObject = wstream;
+        await video.play();
+        statusEl.textContent = 'Point at a USPS barcode';
+        debugEl.textContent = 'Scanner: pro';
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        let wdone = false, werrs = 0;
+        const wtick = async () => {
+          if (wdone) return;
+          try {
+            if (video.readyState >= 2 && video.videoWidth) {
+              const w = Math.min(video.videoWidth, 1920);
+              const h = Math.round(video.videoHeight * (w / video.videoWidth));
+              if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+              ctx.drawImage(video, 0, 0, w, h);
+              const results = await ZXingWASM.readBarcodes(ctx.getImageData(0, 0, w, h), { maxNumberOfSymbols: 6, tryHarder: true });
+              werrs = 0;
+              for (const r of results) {
+                const n = parseTracking(r.text || '');
+                if (n) {
+                  wdone = true;
+                  wstream.getTracks().forEach(t => t.stop());
+                  go(n);
+                  return;
+                }
+                if (r.text) debugEl.textContent = 'Pro scanner read: ' + r.text;
+              }
+            }
+          } catch (e) {
+            werrs++;
+            if (werrs >= 20) {
+              wdone = true;
+              try { wstream.getTracks().forEach(t => t.stop()); } catch (e2) {}
+              window.__noWasm = true;
+              debugEl.textContent = 'Pro scanner could not run - switching to web scanner';
+              start();
+              return;
+            }
+          }
+          if (!wdone) setTimeout(wtick, 300);
+        };
+        wtick();
+        return;
+      } catch (e) {
+        if (wstream) try { wstream.getTracks().forEach(t => t.stop()); } catch (e2) {}
+        window.__noWasm = true;
+        // fall through to the ZXing-JS path below
+      }
+    }
     const reader = makeReader();
     let done = false;
     let lastReject = 0;
@@ -365,7 +444,29 @@
     const img = new Image();
     img.onload = async () => {
       // 1) The barcode itself, from the full-resolution still - a still
-      // photo carries far more detail than a live video frame.
+      // photo carries far more detail than a live video frame. The pro
+      // (zxing-cpp) decoder gets the first try, ZXing-JS the second.
+      try {
+        if (typeof ZXingWASM !== 'undefined') {
+          await ZXingWASM.prepareZXingModule({
+            overrides: { locateFile: (path) => path.endsWith('.wasm')
+              ? 'https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/reader/zxing_reader.wasm'
+              : path },
+            fireImmediately: true
+          });
+          const pc = document.createElement('canvas');
+          const pw = Math.min(img.naturalWidth, 2000);
+          pc.width = pw;
+          pc.height = Math.round(img.naturalHeight * pw / img.naturalWidth);
+          const pctx = pc.getContext('2d');
+          pctx.drawImage(img, 0, 0, pc.width, pc.height);
+          const pres = await ZXingWASM.readBarcodes(pctx.getImageData(0, 0, pc.width, pc.height), { maxNumberOfSymbols: 6, tryHarder: true });
+          for (const r of pres) {
+            const n = parseTracking(r.text || '');
+            if (n) { go(n); URL.revokeObjectURL(url); return; }
+          }
+        }
+      } catch (e) { /* fall through to ZXing-JS */ }
       try {
         const result = await makeReader().decodeFromImageElement(img);
         const n = parseTracking(result.getText());

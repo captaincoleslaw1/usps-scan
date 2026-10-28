@@ -46,6 +46,7 @@
 <div class="scanline"></div>
 <div class="bar top">
   <div id="status">Starting camera…</div>
+  <div id="debug" style="font-size:11px;opacity:.6;margin-top:4px"></div>
   <div id="hint" class="hint"></div>
   <button id="retry" type="button">Tap to start camera</button>
   <input id="photo" type="file" accept="image/*" capture="environment" style="display:none">
@@ -56,13 +57,14 @@
     <input id="num" inputmode="numeric" placeholder="Or type a tracking number" autocomplete="off">
     <button type="submit">Track</button>
   </form>
-  <div class="ver">v4</div>
+  <div class="ver">v5</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <script>
   const statusEl = document.getElementById('status');
+  const debugEl = document.getElementById('debug');
   const hintEl = document.getElementById('hint');
   const retryBtn = document.getElementById('retry');
   const photoBtn = document.getElementById('photoBtn');
@@ -184,7 +186,7 @@
     // Native barcode detection (Apple's Vision framework under the hood)
     // is dramatically better at long Code 128 barcodes than the JS library.
     // Use it when the browser offers it; fall back to ZXing otherwise.
-    if ('BarcodeDetector' in window) {
+    if (!window.__noNative && 'BarcodeDetector' in window) {
       try {
         const formats = await window.BarcodeDetector.getSupportedFormats();
         if (formats.indexOf('code_128') !== -1) {
@@ -195,21 +197,38 @@
           await video.play();
           const detector = new window.BarcodeDetector({ formats: ['code_128'] });
           statusEl.textContent = 'Point at a USPS barcode';
+          debugEl.textContent = 'Scanner: built-in';
           let ndone = false;
+          let errs = 0;
           const tick = async () => {
             if (ndone) return;
             try {
               const codes = await detector.detect(video);
+              errs = 0;
               for (const code of codes) {
-                const n = parseTracking(code.rawValue || '');
+                const raw = code.rawValue || '';
+                const n = parseTracking(raw);
                 if (n) {
                   ndone = true;
                   stream.getTracks().forEach(t => t.stop());
                   go(n);
                   return;
                 }
+                debugEl.textContent = 'Built-in scanner read: ' + raw;
               }
-            } catch (e) { /* keep trying next frame */ }
+            } catch (e) {
+              errs++;
+              if (errs >= 15) {
+                // The built-in detector exists but cannot actually run
+                // here - stop silently looping and hand over to ZXing.
+                ndone = true;
+                try { stream.getTracks().forEach(t => t.stop()); } catch (e2) {}
+                window.__noNative = true;
+                debugEl.textContent = 'Built-in scanner could not run - switching to web scanner';
+                start();
+                return;
+              }
+            }
             if (!ndone) setTimeout(tick, 250);
           };
           tick();
@@ -221,24 +240,42 @@
     let done = false;
     let lastReject = 0;
     let lastErr = null;
+    const onResult = (result) => {
+      if (!result || done) return;
+      const raw = result.getText();
+      const n = parseTracking(raw);
+      if (n) { done = true; try { reader.reset(); } catch (e) {} go(n); }
+      else {
+        debugEl.textContent = 'Web scanner read: ' + raw;
+        const now = Date.now();
+        if (now - lastReject > 3000) {
+          lastReject = now;
+          statusEl.textContent = 'That was not the tracking barcode. Keep the big USPS TRACKING barcode in the box.';
+        }
+      }
+    };
+    // Prefer the main rear camera by name: on multi-camera phones the
+    // generic constraint path can end up on an ultra-wide or front
+    // camera whose stream is too soft for a long thin barcode.
+    try {
+      const devices = await reader.listVideoInputDevices();
+      const back = devices.find(d => /back/i.test(d.label) && !/ultra|tele/i.test(d.label))
+        || devices.find(d => /back/i.test(d.label))
+        || devices[devices.length - 1];
+      if (back) {
+        await reader.decodeFromVideoDevice(back.deviceId, document.getElementById('video'), onResult);
+        debugEl.textContent = 'Scanner: web library';
+        statusEl.textContent = 'Point at a USPS barcode';
+        return;
+      }
+    } catch (err) {
+      lastErr = err;
+      try { reader.reset(); } catch (e) {}
+    }
     for (let i = 0; i < CONSTRAINT_SETS.length; i++) {
       try {
-        await reader.decodeFromConstraints(
-          CONSTRAINT_SETS[i],
-          document.getElementById('video'),
-          (result) => {
-            if (!result || done) return;
-            const n = parseTracking(result.getText());
-            if (n) { done = true; reader.reset(); go(n); }
-            else {
-              const now = Date.now();
-              if (now - lastReject > 3000) {
-                lastReject = now;
-                statusEl.textContent = 'That was not the tracking barcode. Keep the big USPS TRACKING barcode in the box.';
-              }
-            }
-          }
-        );
+        await reader.decodeFromConstraints(CONSTRAINT_SETS[i], document.getElementById('video'), onResult);
+        debugEl.textContent = 'Scanner: web library';
         statusEl.textContent = 'Point at a USPS barcode';
         return;
       } catch (err) {

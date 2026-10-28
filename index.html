@@ -56,10 +56,11 @@
     <input id="num" inputmode="numeric" placeholder="Or type a tracking number" autocomplete="off">
     <button type="submit">Track</button>
   </form>
-  <div class="ver">v3</div>
+  <div class="ver">v4</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <script>
   const statusEl = document.getElementById('status');
   const hintEl = document.getElementById('hint');
@@ -180,6 +181,42 @@
       blockedCamera(null);
       return;
     }
+    // Native barcode detection (Apple's Vision framework under the hood)
+    // is dramatically better at long Code 128 barcodes than the JS library.
+    // Use it when the browser offers it; fall back to ZXing otherwise.
+    if ('BarcodeDetector' in window) {
+      try {
+        const formats = await window.BarcodeDetector.getSupportedFormats();
+        if (formats.indexOf('code_128') !== -1) {
+          const stream = await navigator.mediaDevices.getUserMedia(
+            { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+          const video = document.getElementById('video');
+          video.srcObject = stream;
+          await video.play();
+          const detector = new window.BarcodeDetector({ formats: ['code_128'] });
+          statusEl.textContent = 'Point at a USPS barcode';
+          let ndone = false;
+          const tick = async () => {
+            if (ndone) return;
+            try {
+              const codes = await detector.detect(video);
+              for (const code of codes) {
+                const n = parseTracking(code.rawValue || '');
+                if (n) {
+                  ndone = true;
+                  stream.getTracks().forEach(t => t.stop());
+                  go(n);
+                  return;
+                }
+              }
+            } catch (e) { /* keep trying next frame */ }
+            if (!ndone) setTimeout(tick, 250);
+          };
+          tick();
+          return;
+        }
+      } catch (e) { /* native path failed - ZXing below gets its turn */ }
+    }
     const reader = makeReader();
     let done = false;
     let lastReject = 0;
@@ -218,6 +255,63 @@
 
   retryBtn.addEventListener('click', start);
 
+
+  // Pull a USPS tracking number out of OCR text (the printed digits under
+  // the barcode). Returns { go } for a confident read, or { candidate }
+  // with the raw digits when it is close but not trustworthy enough to
+  // open automatically - the caller pre-fills the manual box with it.
+  function extractTrackingFromText(text) {
+    const groups = String(text).match(/\d[\d ]{16,}\d/g) || [];
+    let best = '';
+    // OCR-only confidence rule: auto-open only a full-length read
+    // (22 digits, or an international S10 code). Anything shorter is
+    // probably a misread digit or two - show it for a quick check
+    // instead of opening a wrong or invalid number.
+    const confident = (n) => !!n && (/^\d{22}$/.test(n) || /^[A-Z]{2}\d{9}US$/.test(n));
+    for (const g of groups) {
+      const digits = g.replace(/\D/g, '');
+      const n = parseTracking(digits);
+      if (confident(n)) return { go: n };
+      if (digits.length > best.length) best = digits;
+    }
+    const all = String(text).replace(/\D/g, '');
+    const n2 = parseTracking(all);
+    if (confident(n2) && all.length <= 34) return { go: n2 };
+    if (best.length >= 18) return { candidate: best };
+    if (all.length >= 18 && all.length <= 36) return { candidate: all };
+    return {};
+  }
+
+  // OCR one image (the printed number line) with Tesseract, digits only.
+  // The photo is binarized first, which printed-label OCR needs badly.
+  async function ocrNumber(img) {
+    const maxW = 1600;
+    const scale = Math.min(2, maxW / img.naturalWidth) || 1;
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.naturalWidth * scale);
+    c.height = Math.round(img.naturalHeight * scale);
+    const ctx = c.getContext('2d');
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    const d = ctx.getImageData(0, 0, c.width, c.height);
+    for (let i = 0; i < d.data.length; i += 4) {
+      const lum = 0.299 * d.data[i] + 0.587 * d.data[i + 1] + 0.114 * d.data[i + 2];
+      const v = lum > 150 ? 255 : 0;
+      d.data[i] = d.data[i + 1] = d.data[i + 2] = v;
+    }
+    ctx.putImageData(d, 0, 0);
+    const worker = await Tesseract.createWorker('eng');
+    await worker.setParameters({
+      tessedit_char_whitelist: '0123456789 ',
+      tessedit_pageseg_mode: '6'
+    });
+    try {
+      const { data } = await worker.recognize(c);
+      return data.text || '';
+    } finally {
+      await worker.terminate();
+    }
+  }
+
   // Photo fallback: works in browsers that block the live camera. Snap (or
   // pick) a picture of the label and decode the barcode from the still image.
   photoBtn.addEventListener('click', () => photoInput.click());
@@ -233,13 +327,34 @@
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = async () => {
+      // 1) The barcode itself, from the full-resolution still - a still
+      // photo carries far more detail than a live video frame.
       try {
         const result = await makeReader().decodeFromImageElement(img);
         const n = parseTracking(result.getText());
-        if (n) { go(n); return; }
-        statusEl.textContent = 'That photo has a barcode, but it is not a USPS tracking number. Try again, closer and in good light.';
-      } catch (e) {
+        if (n) { go(n); URL.revokeObjectURL(url); return; }
+      } catch (e) { /* fall through to reading the printed number */ }
+      // 2) Read the printed tracking number under the barcode (OCR).
+      if (typeof Tesseract === 'undefined') {
         statusEl.textContent = 'No barcode found in that photo. Fill the frame with the barcode, keep it flat and in good light, and try again.';
+        URL.revokeObjectURL(url);
+        return;
+      }
+      statusEl.textContent = 'No barcode read. Reading the printed number instead… (first time can take a few seconds)';
+      try {
+        const text = await ocrNumber(img);
+        const found = extractTrackingFromText(text);
+        if (found.go) { go(found.go); URL.revokeObjectURL(url); return; }
+        if (found.candidate) {
+          const numEl = document.getElementById('num');
+          numEl.value = found.candidate;
+          statusEl.textContent = 'I read a number like the one filled in below. Check it against the label, fix any wrong digit, then tap Track.';
+          numEl.focus();
+        } else {
+          statusEl.textContent = 'Could not read that photo. Snap just the printed tracking number, filling the frame, flat and in good light.';
+        }
+      } catch (e) {
+        statusEl.textContent = 'Could not read that photo. Try again, closer and in good light.';
       }
       URL.revokeObjectURL(url);
     };

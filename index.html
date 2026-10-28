@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="USPS Scan">
+<link rel="icon" href="data:,">
+<title>USPS Scan</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff;
+    font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .guide { position: fixed; top: 50%; left: 50%; width: 85%; max-width: 420px; height: 140px;
+    transform: translate(-50%, -50%); border: 3px solid rgba(255,255,255,.85); border-radius: 14px;
+    box-shadow: 0 0 0 100vmax rgba(0,0,0,.35); pointer-events: none; }
+  .scanline { position: fixed; top: 50%; left: 50%; width: 85%; max-width: 420px; height: 2px;
+    transform: translate(-50%, -50%); background: rgba(255,59,48,.9);
+    animation: sweep 2.2s ease-in-out infinite; pointer-events: none; }
+  @keyframes sweep {
+    0%, 100% { transform: translate(-50%, -62px); }
+    50% { transform: translate(-50%, 62px); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .scanline { animation: none; }
+  }
+  .bar { position: fixed; left: 0; right: 0; padding: 14px 16px; text-align: center;
+    background: rgba(0,0,0,.6); z-index: 2; }
+  .top { top: 0; padding-top: calc(14px + env(safe-area-inset-top, 0px)); font-size: 15px; }
+  .bottom { bottom: 0; padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px)); }
+  .bottom form { display: flex; gap: 8px; }
+  input { flex: 1; min-width: 0; font-size: 16px; padding: 10px; border-radius: 8px; border: 0; }
+  button { font-size: 16px; padding: 10px 16px; border-radius: 8px; border: 0; background: #0a84ff; color: #fff; }
+  a { color: #7cc0ff; }
+  #retry { display: none; margin-top: 8px; background: #0a84ff; }
+  #photoBtn { display: none; margin-top: 8px; margin-left: 8px; background: #3a3a3c; }
+  .hint { display: none; font-size: 13px; line-height: 1.5; opacity: .9; margin-top: 8px; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<div class="guide"></div>
+<div class="scanline"></div>
+<div class="bar top">
+  <div id="status">Starting camera…</div>
+  <div id="hint" class="hint"></div>
+  <button id="retry" type="button">Tap to start camera</button>
+  <button id="photoBtn" type="button">Scan from a photo</button>
+  <input id="photo" type="file" accept="image/*" capture="environment" style="display:none">
+</div>
+<div class="bar bottom">
+  <form id="manual">
+    <input id="num" inputmode="numeric" placeholder="Or type a tracking number" autocomplete="off">
+    <button type="submit">Track</button>
+  </form>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script>
+  const statusEl = document.getElementById('status');
+  const hintEl = document.getElementById('hint');
+  const retryBtn = document.getElementById('retry');
+  const photoBtn = document.getElementById('photoBtn');
+  const photoInput = document.getElementById('photo');
+  const BASE = 'https://tools.usps.com/go/TrackConfirmAction?tLabels=';
+
+  // Turn raw barcode text into a USPS tracking number
+  function parseTracking(raw) {
+    let s = String(raw).trim().toUpperCase();
+    if (s.startsWith(']C1')) s = s.slice(3);                 // GS1 symbology identifier
+    if (/^[A-Z]{2}\d{9}US$/.test(s)) return s;               // international S10
+    const d = s.replace(/\D/g, '');
+    if (d.length < 20) return null;
+    if (d.startsWith('420') && d.length === 30) return d.slice(8);   // 420 + 5-digit ZIP
+    if (d.startsWith('420') && d.length === 34) return d.slice(12);  // 420 + 9-digit ZIP
+    if (d.length > 22) return d.slice(-22);
+    return d;
+  }
+
+  function go(number) {
+    const url = BASE + encodeURIComponent(number);
+    statusEl.innerHTML = 'Opening ' + number + ' … <a href="' + url + '">tap if nothing happens</a>';
+    if (navigator.vibrate) navigator.vibrate(100);
+    window.location.href = url;
+  }
+
+  document.getElementById('manual').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const v = document.getElementById('num').value.trim();
+    const n = parseTracking(v) || v.replace(/\s/g, '').toUpperCase();
+    if (n) go(n);
+  });
+
+  function makeReader() {
+    const hints = new Map();
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      ZXing.BarcodeFormat.CODE_128, ZXing.BarcodeFormat.CODE_39,
+      ZXing.BarcodeFormat.DATA_MATRIX, ZXing.BarcodeFormat.QR_CODE,
+      ZXing.BarcodeFormat.PDF_417
+    ]);
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    return new ZXing.BrowserMultiFormatReader(hints, 150);
+  }
+
+  // On iPhone, live camera scanning only works in Safari (or the Home Screen
+  // app). Other iOS browsers and in-app viewers block it, so offer a jump
+  // straight to this same page in Safari.
+  function safariLink() {
+    try {
+      const u = 'x-safari-' + location.href.split('#')[0];
+      return '<a href="' + u + '">Open this page in Safari</a>';
+    } catch (e) {
+      return 'Open this page in Safari';
+    }
+  }
+
+  function blockedCamera(err) {
+    const name = err && err.name ? err.name : '';
+    const ua = navigator.userAgent || '';
+    const isiOS = /iPhone|iPad|iPod/i.test(ua);
+    const isSafari = isiOS && /Safari/i.test(ua) && !/CriOS|FxiOS|EdgiOS|OPiOS/i.test(ua);
+    const noApi = !window.isSecureContext || !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== 'function';
+    let hint = '';
+    if (noApi) {
+      statusEl.textContent = 'This browser can’t open the camera.';
+      hint = isiOS
+        ? safariLink() + ' — live scanning works there, and from the Home Screen icon. Or tap “Scan from a photo” to snap the label instead.'
+        : 'Try opening this page in a full browser, or tap “Scan from a photo” to snap the label instead.';
+    } else if (name === 'NotAllowedError' || name === 'SecurityError') {
+      statusEl.textContent = 'Camera access is blocked for this page.';
+      if (isiOS && !isSafari) {
+        hint = safariLink() + ', add it to your Home Screen, and allow the camera there — live scanning only works in Safari on iPhone. Or tap “Scan from a photo” below.';
+      } else {
+        hint = 'Tap “Tap to start camera” and choose Allow. If you blocked it earlier: in Safari tap the “AA” button in the address bar → Website Settings → Camera → Allow, then reload this page. Or tap “Scan from a photo”.';
+      }
+    } else if (name === 'NotReadableError' || name === 'AbortError') {
+      statusEl.textContent = 'The camera couldn’t start.';
+      hint = 'Another app may be using it — close that app, then tap “Tap to start camera”. Or tap “Scan from a photo”.';
+    } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+      statusEl.textContent = 'No usable camera was found.';
+      hint = 'Tap “Scan from a photo” to snap the label instead, or type the tracking number below.';
+    } else {
+      statusEl.textContent = 'Camera error: ' + (err && err.message ? err.message : err);
+      hint = 'Tap “Scan from a photo” to snap the label instead, or type the tracking number below.';
+    }
+    if (hint) { hintEl.innerHTML = hint; hintEl.style.display = 'block'; }
+    retryBtn.style.display = 'inline-block';
+    photoBtn.style.display = 'inline-block';
+  }
+
+  // From strictest to loosest: if the camera rejects one spec, fall back
+  // instead of giving up (the old single 1080p request failed outright on
+  // cameras that could still scan fine at a lower resolution).
+  const CONSTRAINT_SETS = [
+    { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } },
+    { video: { facingMode: { ideal: 'environment' } } },
+    { video: true }
+  ];
+
+  async function start() {
+    retryBtn.style.display = 'none';
+    photoBtn.style.display = 'none';
+    hintEl.style.display = 'none';
+    statusEl.textContent = 'Starting camera…';
+    if (typeof ZXing === 'undefined') {
+      statusEl.textContent = 'Scanner library failed to load — check your connection, then tap retry.';
+      retryBtn.style.display = 'inline-block';
+      photoBtn.style.display = 'inline-block';
+      return;
+    }
+    if (!window.isSecureContext || !navigator.mediaDevices ||
+        typeof navigator.mediaDevices.getUserMedia !== 'function') {
+      blockedCamera(null);
+      return;
+    }
+    const reader = makeReader();
+    let done = false;
+    let lastErr = null;
+    for (let i = 0; i < CONSTRAINT_SETS.length; i++) {
+      try {
+        await reader.decodeFromConstraints(
+          CONSTRAINT_SETS[i],
+          document.getElementById('video'),
+          (result) => {
+            if (!result || done) return;
+            const n = parseTracking(result.getText());
+            if (n) { done = true; reader.reset(); go(n); }
+            else statusEl.textContent = 'Read a barcode, but it is not a USPS tracking number';
+          }
+        );
+        statusEl.textContent = 'Point at a USPS barcode';
+        return;
+      } catch (err) {
+        lastErr = err;
+        try { reader.reset(); } catch (e) {}
+        const name = err && err.name ? err.name : '';
+        // Only a spec problem is worth retrying looser; a permission block
+        // or busy camera will fail the same way at every setting.
+        if (name !== 'OverconstrainedError' && name !== 'NotFoundError') break;
+      }
+    }
+    blockedCamera(lastErr);
+  }
+
+  retryBtn.addEventListener('click', start);
+
+  // Photo fallback: works in browsers that block the live camera. Snap (or
+  // pick) a picture of the label and decode the barcode from the still image.
+  photoBtn.addEventListener('click', () => photoInput.click());
+  photoInput.addEventListener('change', () => {
+    const file = photoInput.files && photoInput.files[0];
+    photoInput.value = '';
+    if (!file) return;
+    if (typeof ZXing === 'undefined') {
+      statusEl.textContent = 'Scanner library failed to load — check your connection.';
+      return;
+    }
+    statusEl.textContent = 'Reading photo…';
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = async () => {
+      try {
+        const result = await makeReader().decodeFromImageElement(img);
+        const n = parseTracking(result.getText());
+        if (n) { go(n); return; }
+        statusEl.textContent = 'That photo has a barcode, but it is not a USPS tracking number. Try again, closer and in good light.';
+      } catch (e) {
+        statusEl.textContent = 'No barcode found in that photo. Fill the frame with the barcode, keep it flat and in good light, and try again.';
+      }
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      statusEl.textContent = 'Could not read that photo.';
+    };
+    img.src = url;
+  });
+
+  // Restart scanning if the page is restored from the back/forward cache
+  window.addEventListener('pageshow', (e) => { if (e.persisted) location.reload(); });
+  start();
+</script>
+</body>
+</html>

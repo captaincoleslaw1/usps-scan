@@ -35,7 +35,8 @@
   button { font-size: 16px; padding: 10px 16px; border-radius: 8px; border: 0; background: #0a84ff; color: #fff; }
   a { color: #7cc0ff; }
   #retry { display: none; margin-top: 8px; background: #0a84ff; }
-  #photoBtn { display: none; margin-top: 8px; margin-left: 8px; background: #3a3a3c; }
+  #photoBtn { background: #3a3a3c; width: 100%; margin-bottom: 8px; }
+  .ver { font-size: 11px; opacity: .55; margin-top: 6px; text-align: right; }
   .hint { display: none; font-size: 13px; line-height: 1.5; opacity: .9; margin-top: 8px; }
 </style>
 </head>
@@ -47,14 +48,15 @@
   <div id="status">Starting camera…</div>
   <div id="hint" class="hint"></div>
   <button id="retry" type="button">Tap to start camera</button>
-  <button id="photoBtn" type="button">Scan from a photo</button>
   <input id="photo" type="file" accept="image/*" capture="environment" style="display:none">
 </div>
 <div class="bar bottom">
+  <button id="photoBtn" type="button">Scan from a photo</button>
   <form id="manual">
     <input id="num" inputmode="numeric" placeholder="Or type a tracking number" autocomplete="off">
     <button type="submit">Track</button>
   </form>
+  <div class="ver">v3</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
@@ -95,10 +97,14 @@
 
   function makeReader() {
     const hints = new Map();
+    // CODE_128 ONLY on purpose: the USPS tracking barcode is GS1-128.
+    // USPS/Amazon labels are covered in Data Matrix routing codes, and
+    // those decode much more easily than the long thin tracking barcode.
+    // When they were allowed, the reader kept grabbing them first and
+    // rejecting them as "not a USPS tracking number", so the real
+    // tracking code never got a chance.
     hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-      ZXing.BarcodeFormat.CODE_128, ZXing.BarcodeFormat.CODE_39,
-      ZXing.BarcodeFormat.DATA_MATRIX, ZXing.BarcodeFormat.QR_CODE,
-      ZXing.BarcodeFormat.PDF_417
+      ZXing.BarcodeFormat.CODE_128
     ]);
     hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
     return new ZXing.BrowserMultiFormatReader(hints, 150);
@@ -148,7 +154,6 @@
     }
     if (hint) { hintEl.innerHTML = hint; hintEl.style.display = 'block'; }
     retryBtn.style.display = 'inline-block';
-    photoBtn.style.display = 'inline-block';
   }
 
   // From strictest to loosest: if the camera rejects one spec, fall back
@@ -162,7 +167,6 @@
 
   async function start() {
     retryBtn.style.display = 'none';
-    photoBtn.style.display = 'none';
     hintEl.style.display = 'none';
     statusEl.textContent = 'Starting camera…';
     if (typeof ZXing === 'undefined') {
@@ -178,6 +182,7 @@
     }
     const reader = makeReader();
     let done = false;
+    let lastReject = 0;
     let lastErr = null;
     for (let i = 0; i < CONSTRAINT_SETS.length; i++) {
       try {
@@ -188,7 +193,13 @@
             if (!result || done) return;
             const n = parseTracking(result.getText());
             if (n) { done = true; reader.reset(); go(n); }
-            else statusEl.textContent = 'Read a barcode, but it is not a USPS tracking number';
+            else {
+              const now = Date.now();
+              if (now - lastReject > 3000) {
+                lastReject = now;
+                statusEl.textContent = 'That was not the tracking barcode. Keep the big USPS TRACKING barcode in the box.';
+              }
+            }
           }
         );
         statusEl.textContent = 'Point at a USPS barcode';

@@ -6,9 +6,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="USPS Scan">
+<meta name="apple-mobile-web-app-title" content="Pkg Scan">
 <link rel="icon" href="data:,">
-<title>USPS Scan</title>
+<title>Pkg Scan</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; color: #fff;
     font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
@@ -54,10 +54,10 @@
 <div class="bar bottom">
   <button id="photoBtn" type="button">Scan from a photo</button>
   <form id="manual">
-    <input id="num" inputmode="numeric" placeholder="Or type a tracking number" autocomplete="off">
+    <input id="num" placeholder="Or type a tracking number" autocomplete="off" autocapitalize="characters">
     <button type="submit">Track</button>
   </form>
-  <div class="ver">v6</div>
+  <div class="ver">v7</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
@@ -85,30 +85,65 @@
     return d;
   }
 
-  function go(number) {
-    const url = BASE + encodeURIComponent(number);
-    statusEl.innerHTML = 'Opening ' + number + ' … <a href="' + url + '">tap if nothing happens</a>';
+  function fedexResult(num) {
+    return { carrier: 'FedEx', number: num, url: 'https://www.fedex.com/fedextrack/?trknbr=' + num };
+  }
+
+  // Decide which carrier a raw barcode (or typed number) belongs to and
+  // build its tracking link. Returns null when nothing fits.
+  function classify(raw) {
+    if (raw == null) return null;
+    const text = String(raw).toUpperCase();
+    // UPS numbers (1Z + 16) are unmistakable, in Code 128 and in the
+    // round MaxiCode payload alike.
+    const ups = text.match(/1Z[0-9A-Z]{16}/);
+    if (ups) return { carrier: 'UPS', number: ups[0], url: 'https://www.ups.com/track?tracknum=' + ups[0] };
+    const digits = text.replace(/\D/g, '');
+    // FedEx Ground GS1 string: (420) + destination ZIP + 15-digit tracking.
+    // Must be checked before the USPS rules, which would otherwise claim
+    // the combined digit string.
+    const g420 = digits.match(/^420\d{5}(\d{15})$/);
+    if (g420) return fedexResult(g420[1]);
+    // FedEx bare numbers: 12 digits (Express) or 15 digits (Ground).
+    if (/^\d{12}$/.test(digits) || /^\d{15}$/.test(digits)) return fedexResult(digits);
+    // USPS: GS1-128 package codes, 20-22 digit numbers, S10 international.
+    const usps = parseTracking(text);
+    if (usps) return { carrier: 'USPS', number: usps, url: BASE + encodeURIComponent(usps) };
+    return null;
+  }
+
+  function goResult(res) {
+    statusEl.innerHTML = 'Opening ' + res.carrier + ' ' + res.number + ' … <a href="' + res.url + '">tap if nothing happens</a>';
     if (navigator.vibrate) navigator.vibrate(100);
-    window.location.href = url;
+    window.location.href = res.url;
+  }
+
+  // Retail product codes are not tracking numbers - never route them.
+  function isProductFormat(fmt) {
+    return /UPC|EAN|ISBN/i.test(String(fmt || ''));
   }
 
   document.getElementById('manual').addEventListener('submit', (e) => {
     e.preventDefault();
     const v = document.getElementById('num').value.trim();
-    const n = parseTracking(v) || v.replace(/\s/g, '').toUpperCase();
-    if (n) go(n);
+    const res = classify(v);
+    if (res) goResult(res);
+    else if (v) statusEl.textContent = 'That does not look like a USPS, UPS, or FedEx tracking number. Check it and try again.';
   });
 
   function makeReader() {
     const hints = new Map();
-    // CODE_128 ONLY on purpose: the USPS tracking barcode is GS1-128.
-    // USPS/Amazon labels are covered in Data Matrix routing codes, and
-    // those decode much more easily than the long thin tracking barcode.
-    // When they were allowed, the reader kept grabbing them first and
-    // rejecting them as "not a USPS tracking number", so the real
-    // tracking code never got a chance.
+    // The pro WASM engine does the heavy lifting; this ZXing reader is
+    // the fallback for photos and the last-resort live path. Every decode
+    // is passed through classify(), so easy-to-read noise (the Data
+    // Matrix routing codes on USPS/Amazon labels) is simply ignored
+    // while scanning continues - that was not true of the original
+    // design, which accepted the first decode it got.
     hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-      ZXing.BarcodeFormat.CODE_128
+      ZXing.BarcodeFormat.CODE_128,
+      ZXing.BarcodeFormat.PDF_417,
+      ZXing.BarcodeFormat.DATA_MATRIX,
+      ZXing.BarcodeFormat.QR_CODE
     ]);
     hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
     return new ZXing.BrowserMultiFormatReader(hints, 150);
@@ -190,14 +225,16 @@
     if (!window.__noNative && 'BarcodeDetector' in window) {
       try {
         const formats = await window.BarcodeDetector.getSupportedFormats();
-        if (formats.indexOf('code_128') !== -1) {
+        const wanted = ['code_128', 'pdf417', 'data_matrix', 'qr_code'];
+        const usable = wanted.filter(f => formats.indexOf(f) !== -1);
+        if (usable.length) {
           const stream = await navigator.mediaDevices.getUserMedia(
             { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
           const video = document.getElementById('video');
           video.srcObject = stream;
           await video.play();
-          const detector = new window.BarcodeDetector({ formats: ['code_128'] });
-          statusEl.textContent = 'Point at a USPS barcode';
+          const detector = new window.BarcodeDetector({ formats: usable });
+          statusEl.textContent = 'Point at a package barcode';
           debugEl.textContent = 'Scanner: built-in';
           let ndone = false;
           let errs = 0;
@@ -208,11 +245,12 @@
               errs = 0;
               for (const code of codes) {
                 const raw = code.rawValue || '';
-                const n = parseTracking(raw);
-                if (n) {
+                if (isProductFormat(code.format)) continue;
+                const res = classify(raw);
+                if (res) {
                   ndone = true;
                   stream.getTracks().forEach(t => t.stop());
-                  go(n);
+                  goResult(res);
                   return;
                 }
                 debugEl.textContent = 'Built-in scanner read: ' + raw;
@@ -268,7 +306,7 @@
         const video = document.getElementById('video');
         video.srcObject = wstream;
         await video.play();
-        statusEl.textContent = 'Point at a USPS barcode';
+        statusEl.textContent = 'Point at a package barcode';
         debugEl.textContent = 'Scanner: pro';
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -284,11 +322,12 @@
               const results = await ZXingWASM.readBarcodes(ctx.getImageData(0, 0, w, h), { maxNumberOfSymbols: 6, tryHarder: true });
               werrs = 0;
               for (const r of results) {
-                const n = parseTracking(r.text || '');
-                if (n) {
+                if (isProductFormat(r.format)) continue;
+                const res = classify(r.text || '');
+                if (res) {
                   wdone = true;
                   wstream.getTracks().forEach(t => t.stop());
-                  go(n);
+                  goResult(res);
                   return;
                 }
                 if (r.text) debugEl.textContent = 'Pro scanner read: ' + r.text;
@@ -322,14 +361,17 @@
     const onResult = (result) => {
       if (!result || done) return;
       const raw = result.getText();
-      const n = parseTracking(raw);
-      if (n) { done = true; try { reader.reset(); } catch (e) {} go(n); }
+      let fmtName = '';
+      try { fmtName = String(result.getBarcodeFormat()); } catch (e) {}
+      if (isProductFormat(fmtName)) return;
+      const res = classify(raw);
+      if (res) { done = true; try { reader.reset(); } catch (e) {} goResult(res); }
       else {
         debugEl.textContent = 'Web scanner read: ' + raw;
         const now = Date.now();
         if (now - lastReject > 3000) {
           lastReject = now;
-          statusEl.textContent = 'That was not the tracking barcode. Keep the big USPS TRACKING barcode in the box.';
+          statusEl.textContent = 'That was not a tracking barcode. Keep the big tracking barcode in the box.';
         }
       }
     };
@@ -344,7 +386,7 @@
       if (back) {
         await reader.decodeFromVideoDevice(back.deviceId, document.getElementById('video'), onResult);
         debugEl.textContent = 'Scanner: web library';
-        statusEl.textContent = 'Point at a USPS barcode';
+        statusEl.textContent = 'Point at a package barcode';
         return;
       }
     } catch (err) {
@@ -355,7 +397,7 @@
       try {
         await reader.decodeFromConstraints(CONSTRAINT_SETS[i], document.getElementById('video'), onResult);
         debugEl.textContent = 'Scanner: web library';
-        statusEl.textContent = 'Point at a USPS barcode';
+        statusEl.textContent = 'Point at a package barcode';
         return;
       } catch (err) {
         lastErr = err;
@@ -377,30 +419,42 @@
   // with the raw digits when it is close but not trustworthy enough to
   // open automatically - the caller pre-fills the manual box with it.
   function extractTrackingFromText(text) {
-    const groups = String(text).match(/\d[\d ]{16,}\d/g) || [];
+    const direct = classify(text);
+    if (direct && direct.carrier !== 'USPS') return { goRes: direct };
+    // A USPS hit straight from classify() is only trusted at full length:
+    // OCR dropping a digit yields a 20-21 digit string that parseTracking
+    // would otherwise happily accept, and that must stay a check-first
+    // candidate, not an auto-open.
+    if (direct && (/^\d{22}$/.test(direct.number) || /^[A-Z]{2}\d{9}US$/.test(direct.number))) return { goRes: direct };
+    const groups = String(text).match(/\d[\d ]{10,}\d/g) || [];
     let best = '';
-    // OCR-only confidence rule: auto-open only a full-length read
-    // (22 digits, or an international S10 code). Anything shorter is
-    // probably a misread digit or two - show it for a quick check
-    // instead of opening a wrong or invalid number.
-    const confident = (n) => !!n && (/^\d{22}$/.test(n) || /^[A-Z]{2}\d{9}US$/.test(n));
+    // Confident auto-open: an exact-length carrier number (USPS 22,
+    // FedEx 12/15). Anything close-but-off becomes a candidate to check.
+    const tryDigits = (digits) => {
+      const c = classify(digits);
+      if (c && c.carrier === 'FedEx') return c;
+      const n = parseTracking(digits);
+      if (n && /^\d{22}$/.test(n)) return { carrier: 'USPS', number: n, url: BASE + encodeURIComponent(n) };
+      if (n && /^[A-Z]{2}\d{9}US$/.test(n)) return { carrier: 'USPS', number: n, url: BASE + encodeURIComponent(n) };
+      return null;
+    };
     for (const g of groups) {
       const digits = g.replace(/\D/g, '');
-      const n = parseTracking(digits);
-      if (confident(n)) return { go: n };
+      const r = tryDigits(digits);
+      if (r) return { goRes: r };
       if (digits.length > best.length) best = digits;
     }
     const all = String(text).replace(/\D/g, '');
-    const n2 = parseTracking(all);
-    if (confident(n2) && all.length <= 34) return { go: n2 };
-    if (best.length >= 18) return { candidate: best };
-    if (all.length >= 18 && all.length <= 36) return { candidate: all };
+    const r2 = tryDigits(all);
+    if (r2 && all.length <= 34) return { goRes: r2 };
+    if (best.length >= 11) return { candidate: best };
+    if (all.length >= 11 && all.length <= 36) return { candidate: all };
     return {};
   }
 
   // OCR one image (the printed number line) with Tesseract, digits only.
   // The photo is binarized first, which printed-label OCR needs badly.
-  async function ocrNumber(img) {
+  async function ocrNumber(img, whitelist) {
     const maxW = 1600;
     const scale = Math.min(2, maxW / img.naturalWidth) || 1;
     const c = document.createElement('canvas');
@@ -417,7 +471,7 @@
     ctx.putImageData(d, 0, 0);
     const worker = await Tesseract.createWorker('eng');
     await worker.setParameters({
-      tessedit_char_whitelist: '0123456789 ',
+      tessedit_char_whitelist: whitelist || '0123456789 ',
       tessedit_pageseg_mode: '6'
     });
     try {
@@ -462,15 +516,18 @@
           pctx.drawImage(img, 0, 0, pc.width, pc.height);
           const pres = await ZXingWASM.readBarcodes(pctx.getImageData(0, 0, pc.width, pc.height), { maxNumberOfSymbols: 6, tryHarder: true });
           for (const r of pres) {
-            const n = parseTracking(r.text || '');
-            if (n) { go(n); URL.revokeObjectURL(url); return; }
+            if (isProductFormat(r.format)) continue;
+            const res = classify(r.text || '');
+            if (res) { goResult(res); URL.revokeObjectURL(url); return; }
           }
         }
       } catch (e) { /* fall through to ZXing-JS */ }
       try {
         const result = await makeReader().decodeFromImageElement(img);
-        const n = parseTracking(result.getText());
-        if (n) { go(n); URL.revokeObjectURL(url); return; }
+        let fmtName = '';
+        try { fmtName = String(result.getBarcodeFormat()); } catch (e) {}
+        const res = isProductFormat(fmtName) ? null : classify(result.getText());
+        if (res) { goResult(res); URL.revokeObjectURL(url); return; }
       } catch (e) { /* fall through to reading the printed number */ }
       // 2) Read the printed tracking number under the barcode (OCR).
       if (typeof Tesseract === 'undefined') {
@@ -482,7 +539,14 @@
       try {
         const text = await ocrNumber(img);
         const found = extractTrackingFromText(text);
-        if (found.go) { go(found.go); URL.revokeObjectURL(url); return; }
+        if (found.goRes) { goResult(found.goRes); URL.revokeObjectURL(url); return; }
+        if (!found.candidate) {
+          // UPS numbers carry letters (1Z...), which the digits-only
+          // pass cannot see - give the letters a turn before giving up.
+          const text2 = await ocrNumber(img, '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+          const res2 = classify(text2);
+          if (res2) { goResult(res2); URL.revokeObjectURL(url); return; }
+        }
         if (found.candidate) {
           const numEl = document.getElementById('num');
           numEl.value = found.candidate;

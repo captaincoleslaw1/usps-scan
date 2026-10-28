@@ -57,7 +57,7 @@
     <input id="num" placeholder="Or type a tracking number" autocomplete="off" autocapitalize="characters">
     <button type="submit">Track</button>
   </form>
-  <div class="ver">v8</div>
+  <div class="ver">v9</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
@@ -104,12 +104,38 @@
     // the combined digit string.
     const g420 = digits.match(/^420\d{5}(\d{15})$/);
     if (g420) return fedexResult(g420[1]);
+    // FedEx 22-digit numbers starting 98 are NOT USPS numbers (USPS PICs
+    // start 92-95) - v7 sent one to USPS and got "Tracking Not Available".
+    if (/^98\d{20}$/.test(digits)) return fedexResult(digits);
+    // FedEx Ground Economy (SmartPost): 20 digits starting 9261. Its
+    // 22-digit cousin (92 + this) IS a USPS-deliverable PIC and stays
+    // with the USPS rules below.
+    if (/^9261\d{16}$/.test(digits)) return fedexResult(digits);
+    // FedEx long sortation barcodes (start 96 or 98, 28+ digits) carry
+    // the tracking number in a fixed position we have not confirmed
+    // against a real label yet. Never slice them into a fake USPS
+    // number - report the format as not covered instead.
+    if (digits.length >= 28 && /^9[68]/.test(digits)) return { carrier: 'FedEx', pending: true };
     // FedEx bare numbers: 12 digits (Express) or 15 digits (Ground).
     if (/^\d{12}$/.test(digits) || /^\d{15}$/.test(digits)) return fedexResult(digits);
     // USPS: GS1-128 package codes, 20-22 digit numbers, S10 international.
     const usps = parseTracking(text);
     if (usps) return { carrier: 'USPS', number: usps, url: BASE + encodeURIComponent(usps) };
     return null;
+  }
+
+  // One entry point for every engine's raw read: returns true when a
+  // tracking page was opened, 'pending' for a recognized-but-uncovered
+  // FedEx format, false otherwise.
+  function handleRaw(raw, fmt) {
+    if (isProductFormat(fmt)) return false;
+    const res = classify(raw);
+    if (res && res.url) { goResult(res); return true; }
+    if (res && res.pending) {
+      statusEl.textContent = 'That is a FedEx label, but this barcode format is not covered yet.';
+      return 'pending';
+    }
+    return false;
   }
 
   function goResult(res) {
@@ -127,7 +153,8 @@
     e.preventDefault();
     const v = document.getElementById('num').value.trim();
     const res = classify(v);
-    if (res) goResult(res);
+    if (res && res.url) goResult(res);
+    else if (res && res.pending) statusEl.textContent = 'That is a FedEx barcode number, but this format is not covered yet.';
     else if (v) statusEl.textContent = 'That does not look like a USPS, UPS, or FedEx tracking number. Check it and try again.';
   });
 
@@ -245,15 +272,13 @@
               errs = 0;
               for (const code of codes) {
                 const raw = code.rawValue || '';
-                if (isProductFormat(code.format)) continue;
-                const res = classify(raw);
-                if (res) {
+                const hr = handleRaw(raw, code.format);
+                if (hr === true) {
                   ndone = true;
                   stream.getTracks().forEach(t => t.stop());
-                  goResult(res);
                   return;
                 }
-                debugEl.textContent = 'Built-in scanner read: ' + raw;
+                if (hr === false) debugEl.textContent = 'Built-in scanner read: ' + raw;
               }
             } catch (e) {
               errs++;
@@ -322,15 +347,13 @@
               const results = await ZXingWASM.readBarcodes(ctx.getImageData(0, 0, w, h), { maxNumberOfSymbols: 6, tryHarder: true });
               werrs = 0;
               for (const r of results) {
-                if (isProductFormat(r.format)) continue;
-                const res = classify(r.text || '');
-                if (res) {
+                const hr = handleRaw(r.text || '', r.format);
+                if (hr === true) {
                   wdone = true;
                   wstream.getTracks().forEach(t => t.stop());
-                  goResult(res);
                   return;
                 }
-                if (r.text) debugEl.textContent = 'Pro scanner read: ' + r.text;
+                if (hr === false && r.text) debugEl.textContent = 'Pro scanner read: ' + r.text;
               }
             }
           } catch (e) {
@@ -363,10 +386,9 @@
       const raw = result.getText();
       let fmtName = '';
       try { fmtName = String(result.getBarcodeFormat()); } catch (e) {}
-      if (isProductFormat(fmtName)) return;
-      const res = classify(raw);
-      if (res) { done = true; try { reader.reset(); } catch (e) {} goResult(res); }
-      else {
+      const hr = handleRaw(raw, fmtName);
+      if (hr === true) { done = true; try { reader.reset(); } catch (e) {} }
+      else if (hr === false) {
         debugEl.textContent = 'Web scanner read: ' + raw;
         const now = Date.now();
         if (now - lastReject > 3000) {
@@ -420,6 +442,7 @@
   // open automatically - the caller pre-fills the manual box with it.
   function extractTrackingFromText(text) {
     const direct = classify(text);
+    if (direct && direct.pending) return {};
     if (direct && direct.carrier !== 'USPS') return { goRes: direct };
     // A USPS hit straight from classify() is only trusted at full length:
     // OCR dropping a digit yields a 20-21 digit string that parseTracking
@@ -516,9 +539,7 @@
           pctx.drawImage(img, 0, 0, pc.width, pc.height);
           const pres = await ZXingWASM.readBarcodes(pctx.getImageData(0, 0, pc.width, pc.height), { maxNumberOfSymbols: 6, tryHarder: true });
           for (const r of pres) {
-            if (isProductFormat(r.format)) continue;
-            const res = classify(r.text || '');
-            if (res) { goResult(res); URL.revokeObjectURL(url); return; }
+            if (handleRaw(r.text || '', r.format) === true) { URL.revokeObjectURL(url); return; }
           }
         }
       } catch (e) { /* fall through to ZXing-JS */ }
@@ -526,8 +547,7 @@
         const result = await makeReader().decodeFromImageElement(img);
         let fmtName = '';
         try { fmtName = String(result.getBarcodeFormat()); } catch (e) {}
-        const res = isProductFormat(fmtName) ? null : classify(result.getText());
-        if (res) { goResult(res); URL.revokeObjectURL(url); return; }
+        if (handleRaw(result.getText(), fmtName) === true) { URL.revokeObjectURL(url); return; }
       } catch (e) { /* fall through to reading the printed number */ }
       // 2) Read the printed tracking number under the barcode (OCR).
       if (typeof Tesseract === 'undefined') {

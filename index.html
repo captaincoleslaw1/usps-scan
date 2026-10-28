@@ -57,7 +57,7 @@
     <input id="num" placeholder="Or type a tracking number" autocomplete="off" autocapitalize="characters">
     <button type="submit">Track</button>
   </form>
-  <div class="ver">v9</div>
+  <div class="ver">v10</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
@@ -104,6 +104,12 @@
     // the combined digit string.
     const g420 = digits.match(/^420\d{5}(\d{15})$/);
     if (g420) return fedexResult(g420[1]);
+    // FedEx Ground sortation barcode: 34 digits starting 96, tracking
+    // number in the last 12 digits (positions 23-34, after a '00'
+    // separator at 21-22). Confirmed against a real label on
+    // 2026-10-28: raw 9622013700003828508600528879924920 decodes to
+    // TRK# 5288 7992 4920, matching the number printed on the label.
+    if (/^96\d{32}$/.test(digits) && digits.slice(20, 22) === '00') return fedexResult(digits.slice(22));
     // FedEx 22-digit numbers starting 98 are NOT USPS numbers (USPS PICs
     // start 92-95) - v7 sent one to USPS and got "Tracking Not Available".
     if (/^98\d{20}$/.test(digits)) return fedexResult(digits);

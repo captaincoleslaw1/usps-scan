@@ -57,7 +57,7 @@
     <input id="num" placeholder="Or type a tracking number" autocomplete="off" autocapitalize="characters">
     <button type="submit">Track</button>
   </form>
-  <div class="ver">v10</div>
+  <div class="ver">v11</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
@@ -72,6 +72,19 @@
   const photoInput = document.getElementById('photo');
   const BASE = 'https://tools.usps.com/go/TrackConfirmAction?tLabels=';
 
+  // USPS PIC check digit (Mod 10): reading the payload right to left
+  // from the check digit, every second digit counts x3. Verified
+  // against real 22- and 26-digit PICs from Thomas's labels.
+  function validPic(d) {
+    if (!/^\d{22}$/.test(d) && !/^\d{26}$/.test(d)) return false;
+    let tot = 0;
+    for (let i = 0; i < d.length - 1; i++) {
+      const digit = d.charCodeAt(d.length - 2 - i) - 48;
+      tot += (i % 2 === 0) ? digit * 3 : digit;
+    }
+    return (10 - (tot % 10)) % 10 === (d.charCodeAt(d.length - 1) - 48);
+  }
+
   // Turn raw barcode text into a USPS tracking number
   function parseTracking(raw) {
     let s = String(raw).trim().toUpperCase();
@@ -79,8 +92,22 @@
     if (/^[A-Z]{2}\d{9}US$/.test(s)) return s;               // international S10
     const d = s.replace(/\D/g, '');
     if (d.length < 20) return null;
-    if (d.startsWith('420') && d.length === 30) return d.slice(8);   // 420 + 5-digit ZIP
-    if (d.startsWith('420') && d.length === 34) return d.slice(12);  // 420 + 9-digit ZIP
+    if (d.startsWith('420')) {
+      // After the 420 AI comes a 5- or 9-digit ZIP, then the PIC
+      // (22 or 26 digits). A 34-digit string is ambiguous between
+      // ZIP5+26-digit PIC (UPS Ground Saver labels) and ZIP+4+22-digit
+      // PIC - the PIC check digit tells them apart.
+      const rest = d.slice(3);
+      for (const off of [5, 9]) {
+        const pic = rest.slice(off);
+        if ((pic.length === 22 || pic.length === 26) && validPic(pic)) return pic;
+      }
+      if (d.length === 30) return d.slice(8);   // 420 + 5-digit ZIP
+      if (d.length === 34) return d.slice(12);  // 420 + 9-digit ZIP
+      if (d.length > 22) return d.slice(-22);
+      return d;
+    }
+    if (d.length === 26 && /^9[1-5]/.test(d)) return d;      // bare 26-digit PIC
     if (d.length > 22) return d.slice(-22);
     return d;
   }
@@ -122,6 +149,11 @@
     // against a real label yet. Never slice them into a fake USPS
     // number - report the format as not covered instead.
     if (digits.length >= 28 && /^9[68]/.test(digits)) return { carrier: 'FedEx', pending: true };
+    // A short string starting 420 is a destination-ZIP routing barcode
+    // (420 + ZIP or ZIP+4), printed on UPS and USPS labels alike - it is
+    // never a FedEx number, even though 12 digits matches the Express
+    // shape. (Thomas's Ground Saver label proved this the hard way.)
+    if (digits.startsWith('420') && digits.length <= 16) return null;
     // FedEx bare numbers: 12 digits (Express) or 15 digits (Ground).
     if (/^\d{12}$/.test(digits) || /^\d{15}$/.test(digits)) return fedexResult(digits);
     // USPS: GS1-128 package codes, 20-22 digit numbers, S10 international.
@@ -454,7 +486,7 @@
     // OCR dropping a digit yields a 20-21 digit string that parseTracking
     // would otherwise happily accept, and that must stay a check-first
     // candidate, not an auto-open.
-    if (direct && (/^\d{22}$/.test(direct.number) || /^[A-Z]{2}\d{9}US$/.test(direct.number))) return { goRes: direct };
+    if (direct && (/^\d{22}$/.test(direct.number) || /^\d{26}$/.test(direct.number) || /^[A-Z]{2}\d{9}US$/.test(direct.number))) return { goRes: direct };
     const groups = String(text).match(/\d[\d ]{10,}\d/g) || [];
     let best = '';
     // Confident auto-open: an exact-length carrier number (USPS 22,
@@ -464,6 +496,7 @@
       if (c && c.carrier === 'FedEx') return c;
       const n = parseTracking(digits);
       if (n && /^\d{22}$/.test(n)) return { carrier: 'USPS', number: n, url: BASE + encodeURIComponent(n) };
+      if (n && /^\d{26}$/.test(n)) return { carrier: 'USPS', number: n, url: BASE + encodeURIComponent(n) };
       if (n && /^[A-Z]{2}\d{9}US$/.test(n)) return { carrier: 'USPS', number: n, url: BASE + encodeURIComponent(n) };
       return null;
     };

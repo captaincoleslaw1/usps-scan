@@ -57,7 +57,7 @@
     <input id="num" placeholder="Or type a tracking number" autocomplete="off" autocapitalize="characters">
     <button type="submit">Track</button>
   </form>
-  <div class="ver">v11</div>
+  <div class="ver">v12</div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
@@ -116,6 +116,10 @@
     return { carrier: 'FedEx', number: num, url: 'https://www.fedex.com/fedextrack/?trknbr=' + num };
   }
 
+  function speedxResult(num) {
+    return { carrier: 'SpeedX', number: num, url: 'https://tracking.speedx.io/' + num };
+  }
+
   // Decide which carrier a raw barcode (or typed number) belongs to and
   // build its tracking link. Returns null when nothing fits.
   function classify(raw) {
@@ -125,6 +129,14 @@
     // round MaxiCode payload alike.
     const ups = text.match(/1Z[0-9A-Z]{16}/);
     if (ups) return { carrier: 'UPS', number: ups[0], url: 'https://www.ups.com/track?tracknum=' + ups[0] };
+    // SpeedX: SPX + optional 3-letter hub code + digits. Must be checked
+    // on the lettered text BEFORE the digits-only FedEx rules below -
+    // the digits alone (12 of them on a hub-coded label) look exactly
+    // like a FedEx Express number. Shapes: SPX + hub + 12 digits
+    // (SPXCVG126908484328, real label 2026-11-08, verified live at
+    // tracking.speedx.io), SPX + 15 digits, SPX + hub + 18 digits.
+    const spx = text.match(/SPX(?:[A-Z]{3}\d{12}|[A-Z]{3}\d{18}|\d{15})(?![0-9A-Z])/);
+    if (spx) return speedxResult(spx[0]);
     const digits = text.replace(/\D/g, '');
     // FedEx Ground GS1 string: (420) + destination ZIP + 15-digit tracking.
     // Must be checked before the USPS rules, which would otherwise claim
@@ -193,7 +205,7 @@
     const res = classify(v);
     if (res && res.url) goResult(res);
     else if (res && res.pending) statusEl.textContent = 'That is a FedEx barcode number, but this format is not covered yet.';
-    else if (v) statusEl.textContent = 'That does not look like a USPS, UPS, or FedEx tracking number. Check it and try again.';
+    else if (v) statusEl.textContent = 'That does not look like a USPS, UPS, FedEx, or SpeedX tracking number. Check it and try again.';
   });
 
   function makeReader() {
